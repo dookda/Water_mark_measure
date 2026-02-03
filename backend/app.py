@@ -1,13 +1,17 @@
 # backend/app.py
 # -*- coding: utf-8 -*-
+import os
 import json, time, math
 from pathlib import Path
 from typing import List
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
+
+# ====== URL Prefix Configuration ======
+URL_PREFIX = os.getenv("URL_PREFIX", "/watermark")
 
 # ====== Path setup ======
 BASE_DIR = Path(__file__).resolve().parent            # .../backend
@@ -86,10 +90,10 @@ except Exception:
         predict_height_debug = None
         infer_status_fn = None
 
-# ====== App ======
-app = FastAPI(title="Flood Mark API")
+# ====== Sub-App for /watermark prefix ======
+watermark_app = FastAPI(title="Flood Mark API")
 
-app.add_middleware(
+watermark_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
@@ -98,7 +102,7 @@ app.add_middleware(
 )
 
 # เสิร์ฟไฟล์อัปโหลด (ไม่ชน /api/*)
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+watermark_app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # ====== Helpers ======
 def _save_record(rec: dict):
@@ -123,7 +127,7 @@ def _load_records(limit: int = 200) -> List[dict]:
     return items[-limit:]
 
 # ====== API ======
-@app.get("/api/health")
+@watermark_app.get("/api/health")
 def health():
     # infer_ready = true ถ้ามีฟังก์ชัน predict_height_m และไม่ใช่ placeholder
     infer_ready = callable(predict_height_m) and predict_height_m.__name__ != "_not_ready"
@@ -131,7 +135,7 @@ def health():
     status = infer_status_fn() if callable(infer_status_fn) else {"model_ready": infer_ready}
     return {"ok": True, "ts": int(time.time()), "infer_ready": infer_ready, "status": status}
 
-@app.get("/api/infer_status")
+@watermark_app.get("/api/infer_status")
 def api_infer_status():
     if not callable(infer_status_fn):
         # อย่างน้อยบอกว่า import ไม่ได้
@@ -142,13 +146,13 @@ def api_infer_status():
     except Exception as e:
         return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
 
-@app.get("/api/reports")
+@watermark_app.get("/api/reports")
 def get_reports(limit: int = 200):
     items = _load_records(limit=limit)
     items = [_sanitize_for_json(x) for x in items]  # กัน record เก่า ๆ ที่มี NaN
     return {"ok": True, "items": items}
 
-@app.post("/api/report")
+@watermark_app.post("/api/report")
 async def create_report(
     image: UploadFile = File(...),
     lat: str = Form(...), lng: str = Form(...),
@@ -189,7 +193,7 @@ async def create_report(
     return JSONResponse({"ok": True, **rec})
 
 # -------- Debug infer endpoint --------
-@app.post("/api/debug_infer")
+@watermark_app.post("/api/debug_infer")
 async def debug_infer(image: UploadFile = File(...)):
     """
     เซฟรูปแล้วรัน predict_height_debug (ถ้ามี) คืนรายละเอียดดีบั๊กทั้งหมด
@@ -217,7 +221,18 @@ async def debug_infer(image: UploadFile = File(...)):
         )
 
 # ====== Static frontend ======
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+watermark_app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+
+# ====== Main App - Mounts sub-app at /watermark ======
+app = FastAPI(title="Water Mark Measure")
+
+# Redirect root to /watermark
+@app.get("/")
+def redirect_to_watermark():
+    return RedirectResponse(url=URL_PREFIX)
+
+# Mount the watermark sub-application
+app.mount(URL_PREFIX, watermark_app)
 
 # For local run: python backend/app.py
 if __name__ == "__main__":

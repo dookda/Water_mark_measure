@@ -21,6 +21,8 @@ services:
     ports:
       - "7860:7860"
     environment:
+      # URL Prefix for the application
+      - URL_PREFIX=/watermark
       # Model weight paths (inside container)
       - WEIGHTS_YOLO=/app/backend/weights/best.pt
       - CKPT_FUSION=/app/backend/weights/fusion_resnet34_best.pt
