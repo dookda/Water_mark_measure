@@ -1,0 +1,66 @@
+# =================================================
+# Docker Compose for Flood Watermark Measurement
+# =================================================
+# Usage:
+#   docker compose up -d          # Start in background
+#   docker compose up --build     # Rebuild and start
+#   docker compose logs -f        # View logs
+#   docker compose down           # Stop services
+# =================================================
+
+services:
+  # =============================================
+  # Main Application - FastAPI + ML Model
+  # =============================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: water_mark_api
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    environment:
+      # Model weight paths (inside container)
+      - WEIGHTS_YOLO=/app/backend/weights/best.pt
+      - CKPT_FUSION=/app/backend/weights/fusion_resnet34_best.pt
+      - SCALER_JSON=/app/backend/weights/scaler.json
+      # Optional: URLs for downloading weights
+      - YOLO_URL=${YOLO_URL:-}
+      - SCALER_URL=${SCALER_URL:-}
+    volumes:
+      # Persist uploaded images
+      - uploads_data:/app/backend/uploads
+      # Persist database (reports.jsonl)
+      - reports_data:/app/backend/data
+      # Mount weights directory (allows updating without rebuild)
+      - ./backend/weights:/app/backend/weights:ro
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:7860/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+# ==============================================
+# Named Volumes for Data Persistence
+# ==============================================
+volumes:
+  uploads_data:
+    driver: local
+  reports_data:
+    driver: local
+
+# ==============================================
+# Network (optional - default bridge is used)
+# ==============================================
+networks:
+  default:
+    name: watermark_network
+    driver: bridge
