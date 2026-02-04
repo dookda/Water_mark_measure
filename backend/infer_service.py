@@ -5,12 +5,17 @@
 - โหลด YOLO + Fusion model ครั้งเดียว แล้ว reuse
 - รับ path รูป -> คืนค่าความสูงรอยน้ำ (เมตร, ปัด 2 ตำแหน่ง)
 - ถ้า ENV เป็น URL จะดาวน์โหลดไฟล์มาเก็บใน backend/weights อัตโนมัติ
+
+หมายเหตุสำคัญ:
+- ไฟล์นี้เป็น "service" ล้วน ๆ ห้ามมี FastAPI endpoint (@app.get/...)
+- endpoint /api/infer_status อยู่ใน backend/app.py แล้ว และจะ import infer_status() จากไฟล์นี้ไปใช้
 """
+from __future__ import annotations
+
 from pathlib import Path
-import os, io, json, re
+import os, json, re
 import urllib.parse
 import requests
-import numpy as np
 import pandas as pd
 import torch
 from ultralytics import YOLO
@@ -35,12 +40,13 @@ def _env(name: str, default: str | None = None) -> str | None:
     return re.sub(r"[\r\n]+$", "", str(v).strip())
 
 # ENV ที่รับได้ (ทั้งพาธไฟล์และ URL)
-YOLO_URL     = _env("YOLO_URL")         # สำหรับดาวน์โหลด yolo ถ้าให้มาเป็น URL
+YOLO_URL     = _env("YOLO_URL")  # optional: ให้ URL แยกของ yolo ได้
 WEIGHTS_YOLO = _env("WEIGHTS_YOLO", str(WEIGHTS_DIR / "best.pt"))
 
-# CKPT_FUSION มาก่อน; ถ้าไม่มีก็ยอมรับ MODEL_URL (เดิมที่เคยตั้ง)
+# CKPT_FUSION มาก่อน; ถ้าไม่มีก็ยอมรับ MODEL_URL (เดิม)
 CKPT_FUSION  = _env("CKPT_FUSION") or _env("MODEL_URL") or str(WEIGHTS_DIR / "fusion_resnet34_best.pt")
-SCALER_URL   = _env("SCALER_URL")
+
+SCALER_URL   = _env("SCALER_URL")  # optional: URL ของ scaler
 SCALER_JSON  = _env("SCALER_JSON", str(WEIGHTS_DIR / "scaler.json"))
 
 IMG_SIZE_YOLO = int(_env("IMG_SIZE_YOLO", "960"))
@@ -56,9 +62,12 @@ _feat_names      = None
 _img_size_fusion = 384
 _scaler          = None
 
+# เก็บ error ล่าสุด (เอาไว้ให้ infer_status() รายงาน)
+_last_init_error: str | None = None
+
 def _is_url(s: str) -> bool:
     try:
-        u = urllib.parse.urlparse(s)
+        u = urllib.parse.urlparse(str(s))
         return u.scheme in ("http", "https")
     except Exception:
         return False
@@ -66,7 +75,7 @@ def _is_url(s: str) -> bool:
 def _download_to(url: str, dst: Path):
     """ดาวน์โหลดไฟล์แบบ binary (follow redirects)"""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=120) as r:
+    with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         with open(dst, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 512):
@@ -79,55 +88,98 @@ def _ensure_local_file(maybe_url_or_path: str, fallback_name: str) -> Path:
     - ถ้าเป็น URL: ดาวน์โหลดเป็นชื่อ fallback_name ใน WEIGHTS_DIR แล้วคืนพาธไฟล์ที่โหลดได้
     - ถ้าเป็นไฟล์: คืนพาธเดิม (ถ้ามีอยู่)
     """
-    p = Path(maybe_url_or_path)
-    if _is_url(maybe_url_or_path):
+    s = str(maybe_url_or_path)
+    if _is_url(s):
         dst = WEIGHTS_DIR / fallback_name
         if not dst.exists():
-            _download_to(maybe_url_or_path, dst)
+            _download_to(s, dst)
         return dst
     else:
-        # เป็นไฟล์พาธ
+        p = Path(s)
         if not p.exists():
             raise FileNotFoundError(f"File not found: {p}")
         return p
 
 def _lazy_init():
     """โหลดโมเดล/สเกลเลอร์ครั้งเดียว (และดาวน์โหลดไฟล์หากต้อง)"""
-    global _yolo, _fusion_model, _feat_names, _img_size_fusion, _scaler, WEIGHTS_YOLO, CKPT_FUSION, SCALER_JSON
+    global _yolo, _fusion_model, _feat_names, _img_size_fusion, _scaler
+    global WEIGHTS_YOLO, CKPT_FUSION, SCALER_JSON, _last_init_error
 
-    # ---- YOLO weights (รับทั้ง URL/Path) ----
-    if _yolo is None:
-        if YOLO_URL and (not Path(WEIGHTS_YOLO).exists()):
-            # ถ้ามี YOLO_URL และไฟล์ปลายทางยังไม่มี -> ดาวน์โหลดไปที่ WEIGHTS_YOLO
-            _download_to(YOLO_URL, Path(WEIGHTS_YOLO))
-        yolo_path = _ensure_local_file(WEIGHTS_YOLO, "best.pt")
-        WEIGHTS_YOLO = str(yolo_path)
-        _yolo = YOLO(WEIGHTS_YOLO)
-        _yolo.to(str(DEVICE))
+    try:
+        # ---- YOLO weights (รับทั้ง URL/Path) ----
+        if _yolo is None:
+            # ถ้าแยก YOLO_URL มา และปลายทาง WEIGHTS_YOLO ยังไม่มี -> ดาวน์โหลดไปปลายทางนั้น
+            if YOLO_URL and (not Path(WEIGHTS_YOLO).exists()):
+                _download_to(YOLO_URL, Path(WEIGHTS_YOLO))
 
-    # ---- Fusion checkpoint (รับทั้ง URL/Path) ----
-    if _fusion_model is None:
-        ckpt_path = _ensure_local_file(CKPT_FUSION, "fusion_resnet34_best.pt")
-        CKPT_FUSION = str(ckpt_path)
-        _fusion_model, _feat_names, _img_size_fusion = load_checkpoint(CKPT_FUSION, default_img_size=384)
-        _fusion_model.to(DEVICE).eval()
+            yolo_path = _ensure_local_file(WEIGHTS_YOLO, "best.pt")
+            WEIGHTS_YOLO = str(yolo_path)
 
-    # ---- Scaler (json; รับทั้ง URL/Path) ----
-    if _scaler is None:
-        # ถ้ามี SCALER_URL และไฟล์ปลายทางยังไม่มี -> ดาวน์โหลดก่อน
-        if SCALER_URL and (not Path(SCALER_JSON).exists()):
-            _download_to(SCALER_URL, Path(SCALER_JSON))
-        p = Path(SCALER_JSON)
-        if p.exists():
-            with open(p, "r", encoding="utf-8") as f:
-                _scaler = json.load(f)
-        else:
-            _scaler = None  # ไม่มีสเกลเลอร์ก็รันได้
+            _yolo = YOLO(WEIGHTS_YOLO)
+            _yolo.to(str(DEVICE))
+
+        # ---- Fusion checkpoint (รับทั้ง URL/Path) ----
+        if _fusion_model is None:
+            ckpt_path = _ensure_local_file(CKPT_FUSION, "fusion_resnet34_best.pt")
+            CKPT_FUSION = str(ckpt_path)
+
+            _fusion_model, _feat_names, _img_size_fusion = load_checkpoint(
+                CKPT_FUSION, default_img_size=384
+            )
+            _fusion_model.to(DEVICE).eval()
+
+        # ---- Scaler (json; รับทั้ง URL/Path) ----
+        if _scaler is None:
+            # ถ้ามี SCALER_URL และไฟล์ปลายทางยังไม่มี -> ดาวน์โหลดก่อน
+            if SCALER_URL and (not Path(SCALER_JSON).exists()):
+                _download_to(SCALER_URL, Path(SCALER_JSON))
+
+            p = Path(SCALER_JSON)
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    _scaler = json.load(f)
+            else:
+                _scaler = None  # ไม่มีสเกลเลอร์ก็รันได้ (แต่ฟีเจอร์บางส่วนอาจไม่ถูก scale)
+
+        _last_init_error = None
+
+    except Exception as e:
+        _last_init_error = f"{e.__class__.__name__}: {e}"
+        raise
+
+def infer_status() -> dict:
+    """
+    ฟังก์ชันสถานะ (ธรรมดา ไม่ใช่ endpoint):
+    app.py จะ import ไป expose เป็น /api/infer_status เอง
+    """
+    info = {
+        "model_ready": False,
+        "device": DEVICE.type,
+        "weights_yolo": str(WEIGHTS_YOLO),
+        "ckpt_fusion": str(CKPT_FUSION),
+        "scaler_json": str(SCALER_JSON),
+        "has_scaler": False,
+        "error": _last_init_error,
+    }
+    try:
+        _lazy_init()
+        info.update({
+            "model_ready": True,
+            "weights_yolo": str(WEIGHTS_YOLO),
+            "ckpt_fusion": str(CKPT_FUSION),
+            "scaler_json": str(SCALER_JSON),
+            "has_scaler": bool(_scaler is not None),
+            "error": None,
+        })
+        return info
+    except Exception as e:
+        info["error"] = f"{e.__class__.__name__}: {e}"
+        return info
 
 def predict_height_m(image_path: str) -> float:
     """
     รับ path รูป -> คืนความสูงรอยน้ำหน่วย 'เมตร' (ปัด 2 ตำแหน่ง)
-    - ถ้าตรวจไม่เจอ waterline จะคืน NaN
+    - ถ้าตรวจไม่เจอ waterline หรือเกิด error จะคืน NaN
     """
     try:
         _lazy_init()
@@ -140,6 +192,7 @@ def predict_height_m(image_path: str) -> float:
             device=0 if DEVICE.type == "cuda" else "cpu",
             verbose=False
         )[0]
+
         H, W = r.orig_img.shape[:2]
 
         wm = combine_water_masks(r, WATER_CLASS)
@@ -168,19 +221,22 @@ def predict_height_m(image_path: str) -> float:
             y = _fusion_model(im, X_t).detach().cpu().item()
 
         return float(r2([y], 2)[0])
-    except Exception:
+
+    except Exception as e:
+        # อย่ากลืนเงียบ ๆ อย่างน้อย log ไว้ให้ดูใน server logs
+        print("predict_height_m error:", f"{e.__class__.__name__}: {e}")
         return float("nan")
 
 def predict_height_debug(image_path: str) -> dict:
-    """เวอร์ชันดีบั๊ก: คืนรายละเอียดทุกขั้นตอน"""
+    """เวอร์ชันดีบั๊ก: คืนรายละเอียดทุกขั้นตอน + trace เมื่อพัง"""
     dbg = {"ok": False}
     try:
         _lazy_init()
         dbg.update({
             "device": DEVICE.type,
-            "weights_yolo": WEIGHTS_YOLO,
-            "ckpt_fusion": CKPT_FUSION,
-            "scaler_json": SCALER_JSON,
+            "weights_yolo": str(WEIGHTS_YOLO),
+            "ckpt_fusion": str(CKPT_FUSION),
+            "scaler_json": str(SCALER_JSON),
             "has_scaler": bool(_scaler is not None),
         })
 
@@ -192,9 +248,11 @@ def predict_height_debug(image_path: str) -> dict:
             device=0 if DEVICE.type == "cuda" else "cpu",
             verbose=False
         )[0]
+
         H, W = r.orig_img.shape[:2]
         dbg["H"], dbg["W"] = int(H), int(W)
 
+        # boxes summary
         boxes = []
         names = getattr(r, "names", {})
         if getattr(r, "boxes", None) is not None:
@@ -202,8 +260,12 @@ def predict_height_debug(image_path: str) -> dict:
                 cls = int(b.cls.item())
                 conf = float(b.conf.item()) if getattr(b, "conf", None) is not None else None
                 x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
-                boxes.append({"cls": cls, "name": names.get(cls, str(cls)), "conf": round(conf or 0, 3),
-                              "xyxy": [x1, y1, x2, y2]})
+                boxes.append({
+                    "cls": cls,
+                    "name": names.get(cls, str(cls)),
+                    "conf": round(conf or 0, 3),
+                    "xyxy": [x1, y1, x2, y2]
+                })
         dbg["detections"] = boxes
 
         wm = combine_water_masks(r, WATER_CLASS)
@@ -238,6 +300,7 @@ def predict_height_debug(image_path: str) -> dict:
         with torch.no_grad():
             X_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
             y = _fusion_model(im, X_t).detach().cpu().item()
+
         dbg["y_raw"] = float(y)
         dbg["y_m_rounded"] = float(r2([y], 2)[0])
         dbg["ok"] = True
@@ -249,37 +312,3 @@ def predict_height_debug(image_path: str) -> dict:
         dbg["reason"] = f"{e.__class__.__name__}: {e}"
         dbg["trace"] = traceback.format_exc()
         return dbg
-# ... ส่วนบนเหมือนเดิม ...
-
-@app.get("/api/infer_status")
-def infer_status():
-    """
-    ดูสถานะการโหลดโมเดล/ไฟล์: ok? พาธที่ใช้จริงเป็นอะไร
-    """
-    try:
-        ready = callable(predict_height_m) and predict_height_m.__name__ != "_not_ready"
-        # ลองเรียก lazy_init ผ่าน debug ถ้ามี
-        info = {}
-        if callable(predict_height_debug):
-            # เรียกแบบไม่ต้องใส่รูป: แค่ดึงพาธ/สถานะจาก infer_service (ผ่าน attributes global)
-            from . import infer_service as IS  # type: ignore
-            # บังคับ init เบา ๆ โดยเช็คพาธ (จะดาวน์โหลดถ้ายังไม่โหลด)
-            _ = IS.WEIGHTS_YOLO, IS.CKPT_FUSION, IS.SCALER_JSON
-            # อยากให้ init จริง ให้ลองโหลดไฟล์โดยเรียก private
-            try:
-                IS._lazy_init()
-                model_ready = True
-                err = None
-            except Exception as e:
-                model_ready = False
-                err = f"{e.__class__.__name__}: {e}"
-            info = {
-                "model_ready": model_ready,
-                "error": err,
-                "weights_yolo": IS.WEIGHTS_YOLO,
-                "ckpt_fusion": IS.CKPT_FUSION,
-                "scaler_json": IS.SCALER_JSON,
-            }
-        return {"ok": True, "api_ready": ready, **info}
-    except Exception as e:
-        return {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
